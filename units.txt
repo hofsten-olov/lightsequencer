@@ -1,0 +1,64 @@
+# Light Sequencer - Unit Definitions File
+# =========================================
+#
+# This file defines DMX fixture types and their channel mappings.
+# Each unit definition starts with [UnitName] and lists channel functions.
+#
+# Format:
+#   [Unit Name]
+#   channel_number = Function Name
+#   channel_number = Function Name
+#   ...
+#
+# Channel numbers are relative offsets from the DMX start address.
+# For example, if DMX address is 10 and channel 1 = Mode,
+# then Mode is on absolute DMX channel 10.
+#
+# Lines starting with # are comments and are ignored.
+# Blank lines are ignored.
+#
+# You can add new units by copying an existing block and modifying it.
+# =========================================
+
+[Laserworld EL-230RGB MK2]
+1 = Mode
+2 = Pattern
+3 = X-Axis
+4 = Y-Axis
+5 = Scan Speed
+6 = Dynamic Speed
+7 = Zoom
+8 = Color
+9 = Color Segment
+
+[Generic RGB Laser]
+1 = Mode
+2 = Pattern
+3 = X-Axis
+4 = Y-Axis
+5 = Scan Speed
+6 = Color
+
+[Generic RGBW Par]
+1 = Dimmer
+2 = Red
+3 = Green
+4 = Blue
+5 = White
+6 = Strobe
+7 = Mode
+
+[Moving Head Spot]
+1 = Pan
+2 = Pan Fine
+3 = Tilt
+4 = Tilt Fine
+5 = Speed
+6 = Dimmer
+7 = Strobe
+8 = Color Wheel
+9 = Gobo Wheel
+10 = Gobo Rotation
+11 = Prism
+12 = Focus
+13 = Zoom
