@@ -1199,11 +1199,23 @@ class MainWindow(QtWidgets.QWidget):
         left.addWidget(self.btn_save_config)
         left.addWidget(self.btn_load_config)
         left.addWidget(self.btn_reload_units)
-        left.addWidget(self.dmx_panel)
-        left.addWidget(self.probe_panel)
         left.addStretch(1)
+
+        # Right column — wider than natural so the Fixture Controls sliders
+        # have comfortable room on lower-res screens.
+        self.dmx_panel.setMinimumWidth(500)
+        self.probe_panel.setMinimumWidth(500)
+        right_container = QtWidgets.QWidget()
+        right_container.setMinimumWidth(520)
+        right = QtWidgets.QVBoxLayout(right_container)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.addWidget(self.dmx_panel)
+        right.addWidget(self.probe_panel)
+        right.addStretch(1)
+
         main.addLayout(left, stretch=0)
         main.addWidget(self.grid, stretch=1)
+        main.addWidget(right_container, stretch=0)
 
         root = QtWidgets.QVBoxLayout(self)
         root.addLayout(controls)
