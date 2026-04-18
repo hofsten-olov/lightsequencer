@@ -31,6 +31,15 @@
 8 = Color
 9 = Color Segment
 
+[LED_Bar_7ch]
+1 = Master Dimmer
+2 = Red
+3 = Green
+4 = Blue
+5 = Strobe
+6 = Color Macro
+7 = Function Speed
+
 [Generic RGB Laser]
 1 = Mode
 2 = Pattern
