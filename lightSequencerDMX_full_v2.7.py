@@ -1568,7 +1568,7 @@ class MainWindow(QtWidgets.QWidget):
         self.status_lbl.setText(text)
 
     # ---------- Step & Gate ----------
-    @QtCore.Slot(int, list)
+    @QtCore.pyqtSlot(int, list)
     def on_step(self, step_idx, values):
         if self._closing or self._probe_active:
             return
