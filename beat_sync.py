@@ -1,6 +1,6 @@
 
 # beat_sync.py
-# Mic → BPM via spectral-flux onsets + autocorrelation (pure NumPy), no aubio needed.
+# Mic -> BPM via spectral-flux onsets + autocorrelation (pure NumPy), no aubio needed.
 # Provides BeatDetector class with: start(), stop(), status(), set_latency_ms(int SIGNED), build_sync_payload()
 
 import time, math, threading, collections
@@ -14,24 +14,56 @@ def _hamming(N: int) -> np.ndarray:
 class _FluxTempo:
     """
     Real-time spectral-flux onset detection + BPM estimation (autocorrelation).
-    Tuned for 44.1 kHz / 1024 frame / 512 hop (~86 fps). Adjust sr/frame/hop as needed.
+    All tuning parameters are mutable at runtime via set_params().
     """
-    def __init__(self, sr=44100, frame=1024, hop=512,
+    def __init__(self, sr=44100, frame=2048, hop=512,
                  flux_threshold_k=1.5, ema_alpha=0.12,
-                 bpm_min=60, bpm_max=180):
+                 bpm_min=100, bpm_max=180, bass_cutoff=400,
+                 debounce_ms=80, jump_weight=0.7, env_sr=400.0):
         self.sr = sr; self.frame = frame; self.hop = hop
         self.win = _hamming(frame)
+        # Tunable parameters
+        self.bass_cutoff = bass_cutoff
+        self._n_bins = frame // 2 + 1
+        self._freq_per_bin = sr / frame
+        self._build_weights(bass_cutoff)
         self._prev_mag = None
         self._overlap = np.zeros((frame-hop,), dtype=np.float32)
         self.flux_hist = collections.deque(maxlen=200)
         self.onset_times = collections.deque(maxlen=64)
         self.k = flux_threshold_k
         self.alpha = ema_alpha
+        self.debounce_s = debounce_ms / 1000.0
+        self.jump_weight = jump_weight  # weight on OLD bpm (0=trust new, 1=ignore new)
+        self.env_sr = env_sr  # autocorrelation envelope sample rate
         self._ema_init = False
         self.bpm = 0.0
         self.confidence = 0.0
         self.last_beat_time = 0.0
         self.bpm_min = bpm_min; self.bpm_max = bpm_max
+
+    def _build_weights(self, cutoff_hz):
+        """Build frequency weight curve: 1.0 below cutoff, tapering to 0.1 above."""
+        freqs = np.arange(self._n_bins) * self._freq_per_bin
+        w = np.where(freqs <= cutoff_hz, 1.0,
+                     0.1 + 0.9 * np.exp(-(freqs - cutoff_hz) / max(cutoff_hz, 50)))
+        self._freq_weights = w.astype(np.float32)
+
+    def set_bass_cutoff(self, hz):
+        self.bass_cutoff = hz
+        self._build_weights(hz)
+        self._prev_mag = None
+
+    def reset(self):
+        """Clear accumulated state so detection restarts fresh."""
+        self._prev_mag = None
+        self._overlap = np.zeros((self.frame - self.hop,), dtype=np.float32)
+        self.flux_hist.clear()
+        self.onset_times.clear()
+        self._ema_init = False
+        self.bpm = 0.0
+        self.confidence = 0.0
+        self.last_beat_time = 0.0
 
     def _frames(self, x_mono: np.ndarray):
         data = np.concatenate([self._overlap, x_mono])
@@ -51,7 +83,8 @@ class _FluxTempo:
             return 0.0
         diff = mag - self._prev_mag
         self._prev_mag = mag
-        return float(np.sum(np.clip(diff, 0, None)))
+        # Weighted sum: bass emphasized, highs attenuated but not ignored
+        return float(np.sum(np.clip(diff, 0, None) * self._freq_weights))
 
     def _maybe_onset(self, flux: float, now: float) -> bool:
         self.flux_hist.append(flux)
@@ -61,8 +94,7 @@ class _FluxTempo:
         sd = np.std(self.flux_hist) + 1e-6
         thr = mu + self.k*sd
         if flux > thr:
-            # debounce 80 ms
-            if len(self.onset_times) == 0 or (now - self.onset_times[-1]) > 0.08:
+            if len(self.onset_times) == 0 or (now - self.onset_times[-1]) > self.debounce_s:
                 self.onset_times.append(now)
                 return True
         return False
@@ -71,8 +103,7 @@ class _FluxTempo:
         if len(self.onset_times) < 6:
             return 0.0, 0.0
         tt = np.array(self.onset_times)
-        # build binary onset train @ 100 Hz over last ~8 s
-        sr_env = 100.0; T = 8.0
+        sr_env = self.env_sr; T = 8.0
         now = tt[-1]; t0 = now - T
         n = max(50, int(T*sr_env))
         env = np.zeros(n, dtype=np.float32)
@@ -112,7 +143,7 @@ class _FluxTempo:
             est, conf = self._estimate_bpm()
             if est > 0:
                 if self.bpm > 0:
-                    est = 0.7*self.bpm + 0.3*est  # suppress jumps
+                    est = self.jump_weight*self.bpm + (1.0 - self.jump_weight)*est
                 if not self._ema_init:
                     self.bpm = est; self._ema_init = True
                 else:
@@ -121,23 +152,116 @@ class _FluxTempo:
                 self.last_beat_time = now
 
 
+class _KickDetector:
+    """
+    Standalone low-band spectral-flux onset detector for kick-drum-like transients.
+    Independent of the BPM detector so its thresholds can be tuned separately.
+    Exposes an incrementing onset_count that the main app can poll.
+    """
+    def __init__(self, sr=44100, frame=2048, hop=512,
+                 cutoff_hz=180, hp_hz=30, threshold_k=2.0, debounce_ms=120):
+        self.sr = sr; self.frame = frame; self.hop = hop
+        self.win = _hamming(frame)
+        self.cutoff_hz = cutoff_hz
+        self.hp_hz = hp_hz
+        self._freq_per_bin = sr / frame
+        self._recalc_bins()
+        self._prev_mag = None
+        self._overlap = np.zeros((frame - hop,), dtype=np.float32)
+        self.flux_hist = collections.deque(maxlen=200)
+        self.k = threshold_k
+        self.debounce_s = debounce_ms / 1000.0
+        self.last_onset_time = 0.0
+        self.last_flux = 0.0
+        self.onset_count = 0
+
+    def _recalc_bins(self):
+        lo = max(0, int(self.hp_hz / self._freq_per_bin))
+        hi = max(lo + 1, int(self.cutoff_hz / self._freq_per_bin))
+        self._lo_bin = lo
+        self._hi_bin = hi
+
+    def set_cutoff(self, hz):
+        self.cutoff_hz = hz
+        self._recalc_bins()
+        self._prev_mag = None
+
+    def set_hp(self, hz):
+        self.hp_hz = hz
+        self._recalc_bins()
+        self._prev_mag = None
+
+    def reset(self):
+        self._prev_mag = None
+        self._overlap = np.zeros((self.frame - self.hop,), dtype=np.float32)
+        self.flux_hist.clear()
+        self.onset_count = 0
+        self.last_onset_time = 0.0
+        self.last_flux = 0.0
+
+    def _frames(self, x_mono):
+        data = np.concatenate([self._overlap, x_mono])
+        i = 0
+        while i + self.frame <= len(data):
+            yield data[i:i + self.frame]
+            i += self.hop
+        tail = data[i:]
+        keep = self.frame - self.hop
+        self._overlap = tail[-keep:].copy() if len(tail) >= keep else tail.copy()
+
+    def _spectral_flux(self, f):
+        xw = f * self.win
+        mag = np.abs(np.fft.rfft(xw))
+        # Band-limited: only bins between hp_hz and cutoff_hz
+        mag_band = mag[self._lo_bin:self._hi_bin]
+        if self._prev_mag is None or self._prev_mag.shape != mag_band.shape:
+            self._prev_mag = mag_band
+            return 0.0
+        diff = mag_band - self._prev_mag
+        self._prev_mag = mag_band
+        return float(np.sum(np.clip(diff, 0, None)))
+
+    def process_block(self, mono):
+        now = time.time()
+        for fr in self._frames(mono):
+            flux = self._spectral_flux(fr)
+            self.last_flux = flux
+            self.flux_hist.append(flux)
+            if len(self.flux_hist) < 20:
+                continue
+            mu = np.mean(self.flux_hist)
+            sd = np.std(self.flux_hist) + 1e-6
+            thr = mu + self.k * sd
+            if flux > thr and (now - self.last_onset_time) > self.debounce_s:
+                self.last_onset_time = now
+                self.onset_count += 1
+
+
 class BeatDetector:
     """
     High-level wrapper using sounddevice InputStream.
     Methods:
         start(device=None), stop(), set_latency_ms(int SIGNED),
         status() -> dict, build_sync_payload() -> dict|None
+    Tuning parameters are accessible via:
+        self.proc  - the _FluxTempo instance (BPM/beat detection)
+        self.kick  - the _KickDetector instance (low-band transient trigger)
     """
     def __init__(self, samplerate=44100, bufsize=1024, hopsize=512,
-                 bpm_min=60, bpm_max=180, ema_alpha=0.12):
+                 bpm_min=100, bpm_max=180, ema_alpha=0.12):
         self.sr = samplerate; self.bufsize = bufsize; self.hopsize = hopsize
-        self.proc = _FluxTempo(sr=samplerate, frame=bufsize, hop=hopsize,
+        self.proc = _FluxTempo(sr=samplerate, hop=hopsize,
                                ema_alpha=ema_alpha, bpm_min=bpm_min, bpm_max=bpm_max)
+        self.kick = _KickDetector(sr=samplerate, hop=hopsize)
         self._stream = None
         self._running = False
         self._stopping = False
         self._lock = threading.Lock()
         self._latency_ms = 0  # signed
+        # Ring buffer for audio visualization (last ~100ms at 44100 Hz)
+        self._audio_buf_size = max(4096, bufsize * 4)
+        self._audio_buf = np.zeros(self._audio_buf_size, dtype=np.float32)
+        self._audio_level = 0.0  # RMS level of last callback block
 
     def _callback(self, indata, frames, time_info, status):
         # Quick exit if not running or stopping
@@ -145,13 +269,20 @@ class BeatDetector:
             return
         try:
             mono = np.mean(indata, axis=1).astype(np.float32)
+            # Store audio for visualization
+            n = len(mono)
+            self._audio_buf = np.roll(self._audio_buf, -n)
+            self._audio_buf[-n:] = mono
+            self._audio_level = float(np.sqrt(np.mean(mono * mono)))
             self.proc.process_block(mono)
+            self.kick.process_block(mono)
         except Exception:
             pass  # Ignore errors during callback
 
-    def start(self, device=None):
+    def start(self, device=None) -> str:
+        """Start audio stream. Returns empty string on success, error message on failure."""
         if self._running:
-            return
+            return ""
         self._running = True
         self._stopping = False
         try:
@@ -159,9 +290,11 @@ class BeatDetector:
                                           channels=1, dtype='float32', device=device,
                                           callback=self._callback)
             self._stream.start()
-        except Exception:
+            return ""
+        except Exception as e:
             self._running = False
             self._stream = None
+            return str(e)
 
     def stop(self):
         # Set stopping flag first to make callback exit immediately
