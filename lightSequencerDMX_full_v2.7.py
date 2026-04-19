@@ -1177,6 +1177,13 @@ class MainWindow(QtWidgets.QWidget):
         # Paint state — one flag per channel
         self._paint_active = [False] * len(self.color_names)
 
+        # Auto-paint decay: track global step count when each cell was auto-painted.
+        # 0 means "not auto-painted" (manual clicks stay forever).
+        # Cells older than (4 * seq.beats) steps get cleared on next visit.
+        self._auto_paint_at = np.zeros((len(self.color_names), self.seq.beats), dtype=np.int32)
+        self._global_step_count = 0
+        self._auto_paint_lifetime_bars = 4
+
         main = QtWidgets.QHBoxLayout()
         # Channel Configuration lives in a separate non-modal dialog (set-once panel).
         self.channel_config_dialog = QtWidgets.QDialog(self)
@@ -1461,6 +1468,11 @@ class MainWindow(QtWidgets.QWidget):
         if was_playing:
             self.seq.stop()
         self.seq.set_beats(steps)
+        # Resize auto-paint age tracker to match new step count
+        new_ages = np.zeros((len(self.color_names), steps), dtype=np.int32)
+        copy_cols = min(self._auto_paint_at.shape[1], steps)
+        new_ages[:, :copy_cols] = self._auto_paint_at[:, :copy_cols]
+        self._auto_paint_at = new_ages
         self.grid.update_step_count()
         if was_playing:
             self.seq.step = -1
@@ -1469,6 +1481,7 @@ class MainWindow(QtWidgets.QWidget):
     def _on_clear_all(self):
         """Zero out all cells in the pattern grid."""
         self.seq.pattern[:] = 0
+        self._auto_paint_at[:] = 0
         self.grid.refresh_all()
         self._set_status("Pattern cleared.")
 
@@ -1558,8 +1571,12 @@ class MainWindow(QtWidgets.QWidget):
         """Paint one cell in the pattern and briefly flash the light for the channel."""
         if not (0 <= target_step < self.seq.beats):
             return
-        # Write pattern
+        # Write pattern + tag with global step count so decay can age it out.
+        # Any nonzero value of _auto_paint_at[idx, target_step] marks the cell
+        # as "auto-painted" (subject to decay after N full passes).
         self.seq.pattern[idx, target_step] = 1
+        if target_step < self._auto_paint_at.shape[1]:
+            self._auto_paint_at[idx, target_step] = max(1, self._global_step_count)
         # Refresh the grid cell (highlighted if it IS the current step)
         row_offset, col = self.grid._step_to_grid(target_step)
         self.grid._paint(row_offset + idx, col, target_step == self.seq.step)
@@ -1584,6 +1601,20 @@ class MainWindow(QtWidgets.QWidget):
     def on_step(self, step_idx, values):
         if self._closing or self._probe_active:
             return
+
+        # Global monotonic step counter — drives auto-paint decay.
+        self._global_step_count += 1
+
+        # Auto-paint decay: expire cells older than lifetime_bars full passes.
+        # Manual clicks (where _auto_paint_at is still 0) are left untouched.
+        lifetime_steps = self._auto_paint_lifetime_bars * max(1, self.seq.beats)
+        if 0 <= step_idx < self._auto_paint_at.shape[1]:
+            for c in range(self._auto_paint_at.shape[0]):
+                paint_at = int(self._auto_paint_at[c, step_idx])
+                if paint_at > 0 and (self._global_step_count - paint_at) >= lifetime_steps:
+                    self.seq.pattern[c, step_idx] = 0
+                    self._auto_paint_at[c, step_idx] = 0
+                    values[c] = 0  # don't light an expired cell on this pass
 
         # Paint mode: if any channel button is held, mark this step as ON
         # for that channel in the pattern and force it active for this step.
@@ -1613,6 +1644,22 @@ class MainWindow(QtWidgets.QWidget):
         self.preview.clear_channel(row_idx)
         self.active_colors[row_idx] = 0
         self._dmx_push_from_active()
+
+    def _zero_currently_controlled_channels(self):
+        """Send 0 to every DMX channel currently mapped in color_dmx_map.
+        Call this BEFORE swapping in a new map/config so channels that are no
+        longer controlled don't get stuck at their old values."""
+        if self._closing or not self.dmx.enabled:
+            return
+        channel_configs = self.channel_config.get_all_config()
+        controlled = set()
+        for c in self.color_names:
+            cfg = channel_configs.get(c, {})
+            base_addr = cfg.get("dmx_addr", 1)
+            for rel_ch in (self.color_dmx_map.get(c, {}) or {}).keys():
+                controlled.add(base_addr + int(rel_ch) - 1)
+        if controlled:
+            self.dmx.update_channels([(ch, 0) for ch in controlled])
 
     # ---------- DMX merge (v2.6: uses per-color DMX addresses) ----------
     def _dmx_push_from_active(self):
@@ -1855,6 +1902,10 @@ class MainWindow(QtWidgets.QWidget):
         if not state:
             return
 
+        # Zero any channels controlled by the OLD config so they don't get stuck
+        # at stale values when the new config has a smaller or shifted channel set.
+        self._zero_currently_controlled_channels()
+
         # Restore beat count (default 16 for backwards compat)
         beats = state.get("beats", 16)
         beats = max(4, min(16, int(beats)))
@@ -1865,6 +1916,8 @@ class MainWindow(QtWidgets.QWidget):
         patt = self._coerce_pattern(state.get("pattern", []), beats)
         if patt.shape == (len(self.color_names), beats):
             self.seq.pattern = patt
+            # Reset auto-paint ages: loaded cells are treated as manual (permanent)
+            self._auto_paint_at = np.zeros((len(self.color_names), beats), dtype=np.int32)
             self.grid.update_step_count()
 
         # Gates
@@ -1930,6 +1983,8 @@ class MainWindow(QtWidgets.QWidget):
     def _apply_global(self, g: dict):
         if not g:
             return
+        # Zero any channels controlled by the OLD config before swapping in the new.
+        self._zero_currently_controlled_channels()
         dmx = g.get("dmx_config")
         if dmx:
             self.dmx_panel.set_config(dmx)
