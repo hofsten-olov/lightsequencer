@@ -71,3 +71,33 @@
 11 = Prism
 12 = Focus
 13 = Zoom
+
+# Standard Mode, 16-channel DMX (from Laserworld manual)
+[Laserworld EL-400RGB S]
+1 = Laser On/Off
+2 = Auto/Sound Mode
+3 = Pattern Group
+4 = Pattern
+5 = Color
+6 = Color Speed
+7 = Scan Speed
+8 = Pattern Size
+9 = Z Rotation
+10 = X Rolling-Over
+11 = Y Rolling-Over
+12 = X-Axis
+13 = Y-Axis
+14 = Zoom
+15 = Drawing
+16 = X/Y Wave
+
+# 6-channel mode = direct RGBAW+UV intensities, no master dimmer/strobe.
+# Assumed ADJ Mega Hex Par - if yours is a different "Hex Par" model,
+# check the DMX chart sticker on the fixture and adjust channel order if needed.
+[ADJ Hex Par 6CH]
+1 = Red
+2 = Green
+3 = Blue
+4 = White
+5 = Amber
+6 = UV

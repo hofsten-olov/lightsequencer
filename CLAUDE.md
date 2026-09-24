@@ -1,6 +1,6 @@
 # Light Sequencer DMX
 
-PyQt5 desktop app for beat-synced DMX light sequencing. Main file: `lightSequencerDMX_full_v2.6.py`. Beat detection: `beat_sync.py`.
+PyQt5 desktop app for beat-synced DMX light sequencing. Main file: `lightSequencerDMX_full_v2.7.py`. Beat detection: `beat_sync.py`.
 
 ## Stack
 
@@ -19,7 +19,7 @@ PyQt5 desktop app for beat-synced DMX light sequencing. Main file: `lightSequenc
 
 ## Key conventions
 
-- Versioned files (`v2.3`, `v2.4`, etc.) exist for history; the latest (`v2.6`) is the working copy
+- Versioned files (`v2.3`, `v2.4`, etc.) exist for history; the latest (`v2.7`) is the working copy
 - BPM is never stored in pattern slots (only beat sync governs tempo)
 - Pattern slots store full scenes: pattern grid, gates, DMX config, per-color channel config
 - The sequencer uses eighth-note step pacing: `step_interval = 60 / bpm / 2`
