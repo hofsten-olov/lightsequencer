@@ -833,6 +833,7 @@ class DmxFunctionProbe(QtWidgets.QGroupBox):
     test_update = QtCore.pyqtSignal(dict)
     write_requested = QtCore.pyqtSignal(str, dict)
     read_requested = QtCore.pyqtSignal(str)
+    copy_requested = QtCore.pyqtSignal(str, str)  # (source_color, dest_color)
 
     def __init__(self, color_names=tuple(CHANNELS), default_unit: str = None):
         super().__init__("Fixture Controls")
@@ -876,6 +877,19 @@ class DmxFunctionProbe(QtWidgets.QGroupBox):
         rw_row.addWidget(self.btn_read)
         btn_layout.addLayout(rw_row)
 
+        copy_row = QtWidgets.QHBoxLayout()
+        copy_row.addWidget(QtWidgets.QLabel("Copy settings from:"))
+        self.copy_from_select = QtWidgets.QComboBox()
+        self.copy_from_select.addItems(self.color_names)
+        copy_row.addWidget(self.copy_from_select)
+        self.btn_copy = QtWidgets.QPushButton("Copy")
+        self.btn_copy.setToolTip(
+            "Copy the DMX channel values and fixture type from the chosen color\n"
+            "onto the currently selected color row above (its DMX address is kept)."
+        )
+        copy_row.addWidget(self.btn_copy)
+        btn_layout.addLayout(copy_row)
+
         self._main_layout.addWidget(btn_widget)
 
         # Connect buttons
@@ -883,6 +897,9 @@ class DmxFunctionProbe(QtWidgets.QGroupBox):
         self.btn_stop.clicked.connect(lambda: self.test_stop.emit(self.values_by_channel()))
         self.btn_write.clicked.connect(lambda: self.write_requested.emit(self.color_select.currentText(), self.values_by_channel()))
         self.btn_read.clicked.connect(lambda: self.read_requested.emit(self.color_select.currentText()))
+        self.btn_copy.clicked.connect(
+            lambda: self.copy_requested.emit(self.copy_from_select.currentText(), self.color_select.currentText())
+        )
 
         # Build initial sliders
         self._rebuild_sliders()
@@ -1327,6 +1344,7 @@ class MainWindow(QtWidgets.QWidget):
         self.probe_panel.test_update.connect(self._on_probe_update)
         self.probe_panel.write_requested.connect(self._on_probe_write)
         self.probe_panel.read_requested.connect(self._on_probe_read)
+        self.probe_panel.copy_requested.connect(self._on_probe_copy)
 
         # Connect channel config changes
         self.channel_config.config_changed.connect(self._on_channel_config_changed)
@@ -1713,12 +1731,26 @@ class MainWindow(QtWidgets.QWidget):
 
     def _update_envelopes(self):
         """Recompute every channel's current fade level and push it to the
-        preview strip and DMX. Runs on a shared timer while any channel is
-        mid-envelope, and stops itself once everything has settled to 0."""
+        preview strip and DMX - but only when a level actually changed.
+        Runs on a shared timer while any channel is mid-envelope, and stops
+        itself once everything has settled to 0.
+
+        A channel with ramp_up=0 and ramp_down=0 (the old default, and still
+        the common case) hits its target level immediately and holds it for
+        the whole duration - recomputing and re-pushing an unchanged value
+        every tick would just be wasted work on the GUI thread for the whole
+        time it's on. Since DmxSender's serial thread needs low-jitter timing
+        (a DMX break/frame within microsecond tolerances), extra GIL
+        contention from that busywork could occasionally delay a frame -
+        exactly the kind of intermittent corruption reported after adding
+        ramps. Skipping the push when nothing changed collapses zero-ramp
+        channels back to the old 2-pushes-per-step (on, then off), while
+        channels with a real ramp still update smoothly during it."""
         if self._closing:
             return
         now = time.monotonic()
         any_running = False
+        changed = False
         for row_idx in range(len(self.color_names)):
             if not self._env_running[row_idx]:
                 continue
@@ -1735,11 +1767,15 @@ class MainWindow(QtWidgets.QWidget):
             else:
                 down_elapsed = elapsed_ms - (up_ms + dur_ms)
                 level = 1.0 - (down_elapsed / down_ms) if down_ms > 0 else 0.0
-            self._channel_levels[row_idx] = max(0.0, min(1.0, level))
+            level = max(0.0, min(1.0, level))
+            if abs(level - self._channel_levels[row_idx]) > 1e-6:
+                self._channel_levels[row_idx] = level
+                changed = True
             if self._env_running[row_idx]:
                 any_running = True
-        self.preview.set_values(self._channel_levels)
-        self._dmx_push_levels()
+        if changed:
+            self.preview.set_values(self._channel_levels)
+            self._dmx_push_levels()
         if not any_running:
             self._envelope_timer.stop()
 
@@ -1862,6 +1898,25 @@ class MainWindow(QtWidgets.QWidget):
         m = self.color_dmx_map.get(color_name, {}) or {}
         self.probe_panel.set_from_channel_map(m)
         self._set_status(f"Read {len(m)} channels from '{color_name}'")
+
+    def _on_probe_copy(self, src_color: str, dest_color: str):
+        """Copy DMX channel values + fixture type from src_color onto dest_color.
+        dest_color keeps its own DMX address - only the source's channel values
+        and unit type are copied, so the same effect can drive two fixtures at
+        different addresses (or two positions on one fixture)."""
+        if not src_color or not dest_color or src_color == dest_color:
+            self._set_status("Copy skipped: pick two different colors.")
+            return
+
+        self.color_dmx_map[dest_color] = dict(self.color_dmx_map.get(src_color, {}) or {})
+
+        src_cfg = self.channel_config.get_config(src_color)
+        dest_cfg = self.channel_config.get_config(dest_color)
+        self.channel_config.set_config(dest_color, dest_cfg.get("dmx_addr", 1), src_cfg.get("unit_type", ""))
+
+        # Refresh the probe display (dest_color is whatever's selected above)
+        self._on_probe_color_changed(dest_color)
+        self._set_status(f"Copied settings from {src_color} to {dest_color}.")
 
 
     def _on_play_pressed(self):
@@ -2013,8 +2068,15 @@ class MainWindow(QtWidgets.QWidget):
         out[:, :arr.shape[1]] = arr
         return out
 
-    def _apply_slot_state(self, state: dict):
-        """Apply full scene EXCEPT BPM/phase."""
+    def _apply_slot_state(self, state: dict, include_hardware: bool = True):
+        """Apply full scene EXCEPT BPM/phase.
+
+        include_hardware=False skips the slot's own dmx/color_dmx_map/channel_config
+        (its hardware snapshot from whenever it was last saved) and only applies the
+        pattern + gates. Used when auto-loading slot 1 right after a config file's
+        global hardware settings were just applied, so a stale slot snapshot can't
+        silently revert hardware settings (e.g. a fixture's unit type) the user just
+        set and saved via 'Save Config File...' without also re-saving the slot."""
         if not state:
             return
 
@@ -2041,23 +2103,24 @@ class MainWindow(QtWidgets.QWidget):
         if triples:
             self.gate_panel.set_gates(triples)
 
-        # DMX output config
-        dmx_cfg = state.get("dmx")
-        if dmx_cfg:
-            self.dmx_panel.set_config(dmx_cfg)
-            self._apply_dmx_config()
+        if include_hardware:
+            # DMX output config
+            dmx_cfg = state.get("dmx")
+            if dmx_cfg:
+                self.dmx_panel.set_config(dmx_cfg)
+                self._apply_dmx_config()
 
-        # Color DMX personalities (relative channel maps)
-        raw_map = state.get("color_dmx_map", {})
-        fixed = {}
-        for color, mapping in (raw_map or {}).items():
-            fixed[color] = {int(k): int(v) for k, v in (mapping or {}).items()}
-        self.color_dmx_map = fixed
+            # Color DMX personalities (relative channel maps)
+            raw_map = state.get("color_dmx_map", {})
+            fixed = {}
+            for color, mapping in (raw_map or {}).items():
+                fixed[color] = {int(k): int(v) for k, v in (mapping or {}).items()}
+            self.color_dmx_map = fixed
 
-        # v2.6: Channel config (DMX addresses and unit types)
-        ch_cfg = state.get("channel_config", {})
-        if ch_cfg:
-            self.channel_config.set_all_config(ch_cfg)
+            # v2.6: Channel config (DMX addresses and unit types)
+            ch_cfg = state.get("channel_config", {})
+            if ch_cfg:
+                self.channel_config.set_all_config(ch_cfg)
 
         # Refresh probe with selected color
         cur = self.probe_panel.color_select.currentText()
@@ -2163,11 +2226,13 @@ class MainWindow(QtWidgets.QWidget):
             self._apply_global(data.get("global", {}))
             disk_slots = data.get("slots", {})
             self.slots = {str(n): disk_slots.get(str(n)) for n in SLOTS}
-            # auto-select & load slot 1 if present
+            # auto-select & load slot 1's pattern/gates if present - NOT its hardware
+            # snapshot, which would silently override the global settings just applied
+            # above if slot 1 hasn't been re-saved since a fixture/address change.
             self.slots_panel.btn_group.button(1).setChecked(True)
             if self.slots["1"]:
-                self._apply_slot_state(self.slots["1"])
-            self._set_status(f"Loaded config from {os.path.basename(path)} (v2.6)")
+                self._apply_slot_state(self.slots["1"], include_hardware=False)
+            self._set_status(f"Loaded config from {os.path.basename(path)}")
         except Exception as e:
             QtWidgets.QMessageBox.warning(self, "Error", f"Could not apply configuration:\n{e}")
 
