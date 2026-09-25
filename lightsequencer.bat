@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" "lightSequencerDMX_full_v2.7.py"
+".venv\Scripts\python.exe" "lightSequencerDMX_full_v2.8.py"
 
 if errorlevel 1 (
     echo.
